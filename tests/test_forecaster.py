@@ -37,6 +37,22 @@ def test_batch_of_ragged_series(forecaster, series):
         assert np.isfinite(result.last_window_forecast(i)).all()
 
 
+def test_long_series_forecast_is_independent_of_short_batch_companion(forecaster, series):
+    alone = forecaster.predict_batch([{"target": series, "freq": "D"}])
+    batched = forecaster.predict_batch(
+        [
+            {"target": series, "freq": "D"},
+            {"target": series[:64], "freq": "D"},
+        ]
+    )
+    assert np.allclose(
+        alone.last_window_forecast(0),
+        batched.last_window_forecast(0),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 def test_every_anchor_carries_a_forecast(forecaster, series, tiny_config):
     """all_windows_median gives an in-sample backtest for free."""
     result = forecaster.predict(series, freq="D")

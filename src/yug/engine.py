@@ -186,8 +186,11 @@ class CachedUnivariateEngine:
         self, patches: torch.Tensor, mask: torch.Tensor, state: _RevInState | None
     ):
         """``(B, S, patch_len)`` -> token embeddings ``(B, S, D)``."""
-        validity = mask.float()
+        validity = mask.to(dtype=patches.dtype)
         x, mean, std, nxt = self._revin(patches, mask, state)
+        activation_dtype = self.m.input_layer.input_layer.weight.dtype
+        x = x.to(activation_dtype)
+        validity = validity.to(activation_dtype)
         x = torch.cat([x, validity], dim=-1)
         x = self.m.input_layer(x)
         x = x + self._freq_emb
@@ -304,6 +307,7 @@ class CachedUnivariateEngine:
         nl = len(self.layers)
 
         # Full per-path cache, plus a batch-1 scratch for the prefix pass.
+        cache_dtype = self.m.input_layer.input_layer.weight.dtype
         full_k = [
             torch.empty(
                 n_paths,
@@ -311,14 +315,14 @@ class CachedUnivariateEngine:
                 max_patches,
                 self.hd,
                 device=self.device,
-                dtype=patches.dtype,
+                dtype=cache_dtype,
             )
             for _ in range(nl)
         ]
         full_v = [torch.empty_like(t) for t in full_k]
 
         self._k = [
-            torch.empty(1, self.H, s, self.hd, device=self.device, dtype=patches.dtype)
+            torch.empty(1, self.H, s, self.hd, device=self.device, dtype=cache_dtype)
             for _ in range(nl)
         ]
         self._v = [torch.empty_like(t) for t in self._k]

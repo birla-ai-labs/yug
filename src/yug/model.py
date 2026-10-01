@@ -188,7 +188,7 @@ class Yug_FrequencyEmbedding(nn.Module):
         core_freq_emb = self.freq_embedding(freq_id)
         sinusoidal_emb = self.sinusoidal_encoding(
             scale, d_model=self.out_features, device=device
-        )
+        ).to(core_freq_emb.dtype)
 
         combined = core_freq_emb * sinusoidal_emb
 
@@ -321,7 +321,7 @@ class Yug_SelfAttention(nn.Module):
                 output_mask = attn_mask.unsqueeze(-1)
             else:
                 output_mask = attn_mask.unsqueeze(1).unsqueeze(-1)
-            attn_output = attn_output.nan_to_num(0.0) * output_mask
+            attn_output = attn_output.nan_to_num(0.0) * output_mask.to(attn_output.dtype)
 
         return (
             attn_output.view(batch_size, seq_len, d_model) if univariate else attn_output
@@ -438,7 +438,7 @@ class Yug_CrossAttention(nn.Module):
 
         if attn_mask_q is not None:
             output_mask = attn_mask_q[:, None, :, None]
-            attn_output = attn_output.nan_to_num(0.0) * output_mask
+            attn_output = attn_output.nan_to_num(0.0) * output_mask.to(attn_output.dtype)
 
         return attn_output
 
@@ -603,7 +603,7 @@ class Yug_Variate_MLP(nn.Module):
         x_normed = self.pre_norm(x)
 
         if attn_mask is not None:
-            m = attn_mask.permute(0, 2, 1).unsqueeze(-1).float()
+            m = attn_mask.permute(0, 2, 1).unsqueeze(-1).to(x_variate_cross_attn.dtype)
             cross_perm = x_variate_cross_attn.permute(0, 2, 1, 3)
             denom = m.sum(dim=2).clamp(min=1.0)
             pooled_residual = (cross_perm * m).sum(dim=2) / denom
@@ -812,9 +812,11 @@ class CausalReversibleInstanceNorm(nn.Module):
         return x_norm, mean_fp32, std_fp32
 
     def denormalize(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
-        orig_dtype = x.dtype
+        # Restore the raw data scale in fp32: a valid forecast can exceed
+        # fp16's range even when every normalised activation is representable.
+        x = x.float()
         if self.affine:
-            x = ((x.float() - self.affine_bias) / self.affine_weight).to(orig_dtype)
+            x = (x - self.affine_bias.float()) / self.affine_weight.float()
         if x.ndim == 5:
             b, t, k, q, d = x.shape
             idx = (
@@ -827,7 +829,7 @@ class CausalReversibleInstanceNorm(nn.Module):
             for _ in range(x.ndim - mean.ndim):
                 mean = mean.unsqueeze(-1)
                 std = std.unsqueeze(-1)
-        return (x.float() * std.float() + mean.float()).to(orig_dtype)
+        return x * std.float() + mean.float()
 
 
 class Yug_Model(nn.Module):
@@ -915,18 +917,25 @@ class Yug_Model(nn.Module):
         if attn_mask_target is None:
             attn_mask_target = torch.ones_like(target)
 
-        # Every patch — observed or generated — is a valid attention token, so
-        # the decoder mask uses the original mask untouched.
-        validity_target = attn_mask_target.float()
-
         # The statistics mask is different: it stops at the observed history.
         if num_input_patches is not None:
-            stats_mask_target = attn_mask_target.clone()
-            stats_mask_target[:, num_input_patches:, :] = 0
+            if isinstance(num_input_patches, torch.Tensor):
+                cutoffs = num_input_patches.to(target.device).reshape(-1, 1, 1)
+                positions = torch.arange(target.shape[-2], device=target.device).reshape(
+                    1, -1, 1
+                )
+                stats_mask_target = attn_mask_target * (positions < cutoffs)
+            else:
+                stats_mask_target = attn_mask_target.clone()
+                stats_mask_target[:, num_input_patches:, :] = 0
         else:
             stats_mask_target = attn_mask_target
 
         target, target_mean, target_std = self.CausalRevIn(target, stats_mask_target)
+        target = target.to(self.input_layer.input_layer.weight.dtype)
+        # Every patch — observed or generated — is a valid attention token, so
+        # the decoder mask uses the original mask untouched.
+        validity_target = attn_mask_target.to(dtype=target.dtype)
         target = torch.cat([target, validity_target], dim=-1)
 
         target = self.input_layer(target)
@@ -939,25 +948,32 @@ class Yug_Model(nn.Module):
         target = target + freq_emb
         target = self.input_norm_tar(target)
 
-        patch_attn_mask_target = (attn_mask_target.sum(dim=-1) > 0).float()
+        patch_attn_mask_target = attn_mask_target.sum(dim=-1) > 0
 
         if variates is not None:
             if attn_mask_variates is None:
                 attn_mask_variates = torch.ones_like(variates)
 
-            validity_variates = attn_mask_variates.float()
-
             # Same history/generated split as the target: in multivariate
             # rollout the covariate channels are extended alongside it.
             if num_input_patches is not None:
-                stats_mask_variates = attn_mask_variates.clone()
-                stats_mask_variates[:, :, num_input_patches:, :] = 0
+                if isinstance(num_input_patches, torch.Tensor):
+                    cutoffs = num_input_patches.to(variates.device).reshape(-1, 1, 1, 1)
+                    positions = torch.arange(
+                        variates.shape[-2], device=variates.device
+                    ).reshape(1, 1, -1, 1)
+                    stats_mask_variates = attn_mask_variates * (positions < cutoffs)
+                else:
+                    stats_mask_variates = attn_mask_variates.clone()
+                    stats_mask_variates[:, :, num_input_patches:, :] = 0
             else:
                 stats_mask_variates = attn_mask_variates
 
             variates, variates_mean, variates_std = self.CausalRevIn(
                 variates, stats_mask_variates
             )
+            variates = variates.to(self.input_layer.input_layer.weight.dtype)
+            validity_variates = attn_mask_variates.to(dtype=variates.dtype)
             variates = torch.cat([variates, validity_variates], dim=-1)
             variates = self.input_layer(variates)
 
@@ -965,7 +981,7 @@ class Yug_Model(nn.Module):
             variates = variates + freq_emb_var
             variates = self.input_norm_var(variates)
 
-            attn_mask_variates = (attn_mask_variates.sum(dim=-1) > 0).float()
+            attn_mask_variates = attn_mask_variates.sum(dim=-1) > 0
 
         for layer in self.decoder_layers:
             target, variates = layer(
