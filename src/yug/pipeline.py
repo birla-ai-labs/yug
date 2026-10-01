@@ -259,7 +259,7 @@ class YugPipeline(BaseForecastPipeline):
         context_length: int | None = None,
         engine: str | None = None,
         pad_side: str | None = None,
-        seed: int | None = None,
+        seed: int | np.random.Generator | None = None,
         item_ids: Sequence[Any] | None = None,
     ) -> QuantileForecast:
         """Forecast ``prediction_length`` steps beyond each context series.
@@ -274,6 +274,12 @@ class YugPipeline(BaseForecastPipeline):
             the model, not bookkeeping — it selects a learned embedding, so a
             wrong value degrades the forecast.
 
+        ``context_length``
+            Most recent points fed to the model; longer histories are cut to
+            their latest ``context_length`` points. Defaults to 2048, the
+            window Yug was trained on (see :class:`~yug.configs.PredictionConfig`).
+            ``None`` uses the load-time default; ``0`` feeds the whole series.
+
         ``num_samples``
             Trajectories to draw. More narrows Monte Carlo noise in the
             returned band, at linear cost.
@@ -281,7 +287,8 @@ class YugPipeline(BaseForecastPipeline):
         ``seed``
             Makes the call reproducible. The stream advances across series
             within one call, so a given ``(seed, context, settings)`` always
-            gives the same answer.
+            gives the same answer. A ``np.random.Generator`` is used as-is and
+            left advanced, so one stream can span several calls.
 
         Returns a :class:`~yug.base.QuantileForecast` of shape
         ``(n_series, n_quantiles, prediction_length)``.
@@ -345,20 +352,32 @@ class YugPipeline(BaseForecastPipeline):
     ) -> np.ndarray:
         """One series -> ``(n_quantiles, horizon)``."""
         multivariate = target.ndim == 2
+        if target.shape[-1] == 0:
+            raise ValueError("context is empty; supply at least one observation.")
+
+        # Blocks needed to cover the horizon; the tail is trimmed afterwards.
+        n_steps = -(-horizon // self._output_len)
+
+        # An exactly constant context carries no scale. The causal RevIn floors
+        # the variance at eps, so the model's output would be denormalised as
+        # ``z * sqrt(eps) + mean``: a spuriously dispersed, non-flat forecast of
+        # a flat series. Forecast the constant instead and skip the model. This
+        # is checked on the whole series, before the context_length cut, and
+        # it still consumes the rollout's draws so every later series in the
+        # same stream is unchanged.
+        channel = target[0] if multivariate else target
+        finite = channel[np.isfinite(channel)]
+        if finite.size and not np.ptp(finite) > 0:
+            rng.random(n_samples * n_steps)
+            return np.full((self._n_quantiles, horizon), finite[-1], dtype=np.float32)
 
         if context_length and target.shape[-1] > context_length:
             target = target[..., -context_length:]
 
-        if target.shape[-1] < self._patch_len:
-            raise ValueError(
-                f"context has {target.shape[-1]} point(s) but the model reads whole "
-                f"patches of {self._patch_len}; supply at least one full patch."
-            )
-
+        # A context shorter than one patch is padded up to one like any other
+        # partial patch (M4 yearly has 13-point series); padded positions are
+        # masked out of attention and the normalisation statistics.
         target, _ = pad_to_patch_multiple(target, self._patch_len, pad_side)
-
-        # Blocks needed to cover the horizon; the tail is trimmed afterwards.
-        n_steps = -(-horizon // self._output_len)
 
         if multivariate:
             paths = self._rollout_multivariate(target, freq, n_steps, n_samples, rng)
@@ -398,13 +417,11 @@ class YugPipeline(BaseForecastPipeline):
         values, mask = patchify(target[None, :], patch_len)
         ctx, ctx_mask = self._to_device(values, mask)
 
-        # The cached path needs every patch to be a valid attention token. Left
-        # padding only blanks part of patch 0, so that holds — but a series with
-        # an interior all-NaN patch does not, and falls back.
-        if not bool((ctx_mask.sum(-1) > 0).all()):
-            logger.debug("interior all-NaN patch — falling back to the exact engine")
-            return self._rollout_exact(target, freq, n_steps, n_paths, rng)
-
+        # Patches with no observed value (all-NaN gaps) are handled inside the
+        # engine, exactly as the model's own forward treats them. They must not
+        # divert to the exact rollout: it runs the full model over the whole
+        # context for every path at every step, which is slow and, for a long
+        # context, does not fit in memory.
         freq_ids, scalings = self._freq_tensors(freq, 1)
 
         if self._engine is None:

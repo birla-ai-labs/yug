@@ -58,7 +58,8 @@ class YugPredictor:
         freq: str = "D",
         prediction_length: int | None = None,
         num_samples: int = 100,
-        context_length: int | None = 8192,
+        # The window Yug was trained on and its GIFT-Eval scores were made at.
+        context_length: int | None = 2048,
         engine: str = "cached",
         pad_side: str = "left",
         seed: int = 0,
@@ -122,6 +123,13 @@ class YugPredictor:
             )
         horizon = int(horizon)
 
+        # One stream for the whole call, advanced entry by entry, exactly like
+        # the reference predictor that produced the published GIFT-Eval
+        # numbers. Re-seeding each entry draws different trajectories and so
+        # does not reproduce them. Harnesses walk test_data in a fixed order,
+        # so a given (seed, dataset) still always gives the same forecasts.
+        rng = np.random.default_rng(self.seed)
+
         n = 0
         for entry in dataset:
             target = np.asarray(entry["target"], dtype=np.float32)
@@ -133,9 +141,7 @@ class YugPredictor:
                 context_length=self.context_length,
                 engine=self.engine,
                 pad_side=self.pad_side,
-                # Per-entry seed keeps a sweep reproducible whatever order or
-                # parallelism the harness uses to walk the dataset.
-                seed=self.seed + n,
+                seed=rng,
             )
 
             seq_len = target.shape[-1] if target.ndim == 2 else len(target)

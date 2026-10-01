@@ -35,12 +35,18 @@ First public release of Yug.
 
 ## Available models
 
-| Model | Parameters | Quantile levels | Max context |
+| Model | Parameters | Quantile levels | Context length |
 |---|---|---|---|
-| [`birlaailabs/yug`](https://huggingface.co/birlaailabs/yug) | 271.8M | 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9 | 8192 |
+| [`birlaailabs/yug`](https://huggingface.co/birlaailabs/yug) | 271.8M | 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9 | 2048 |
 
 Quantile levels are fixed at training time: a checkpoint cannot emit a level it
 was not trained on.
+
+Yug was trained on 2048-point context windows, so by default it reads the
+latest 2048 points of each series; shorter series are used whole. This is
+also the setting behind its published benchmark scores. Pass
+`context_length=...` to change it; feeding more history takes the model
+outside its training regime.
 
 ---
 
@@ -160,7 +166,7 @@ forecasts = list(predictor.predict(dataset))
 ```bibtex
 @software{yug_2026,
   title  = {Yug: a foundation model for zero-shot probabilistic time-series forecasting},
-  author = {Aaditya Jain*, Debdeep Sanyal*, Aaryan Nagpal, Dhruv Kumar, Murari Mandal, Saurabh Deshpande},
+  author = {Aaditya Jain* and Debdeep Sanyal* and Aaryan Nagpal and Dhruv Kumar and Murari Mandal and Saurabh Deshpande},
   year   = {2026},
   organization = {Birla AI Labs},
   url    = {https://github.com/birla-ai-labs/yug},

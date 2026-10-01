@@ -131,6 +131,35 @@ def test_gluonts_adapter_emits_quantile_forecasts(pipeline, series):
     assert forecast.start_date == pd.Period("2020-01-01", freq="D") + len(series)
 
 
+def test_gluonts_adapter_walks_one_rng_stream(pipeline, series):
+    """Entries share one stream, as in a single pipeline call over all of them.
+
+    That is how the reference predictor behind the published GIFT-Eval scores
+    draws its trajectories; re-seeding each entry does not reproduce them.
+    """
+    import pandas as pd
+
+    from yug.gluonts_adapter import YugPredictor
+
+    targets = [series, series[:200], series[::-1].copy()]
+    dataset = [
+        {"target": t, "start": pd.Period("2020-01-01", freq="D"), "item_id": str(i)}
+        for i, t in enumerate(targets)
+    ]
+    predictor = YugPredictor(
+        pipeline, freq="D", prediction_length=24, num_samples=8, seed=5
+    )
+    adapter = np.stack([f.forecast_array for f in predictor.predict(dataset)])
+    direct = pipeline.predict(targets, 24, freq="D", num_samples=8, seed=5).values
+    assert np.array_equal(adapter, direct)
+
+
+def test_gluonts_adapter_defaults_to_the_trained_context_window(pipeline):
+    from yug.gluonts_adapter import YugPredictor
+
+    assert YugPredictor(pipeline).context_length == 2048
+
+
 def test_gluonts_adapter_is_zero_shot_only(pipeline):
     from yug.gluonts_adapter import YugPredictor
 

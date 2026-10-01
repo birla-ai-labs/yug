@@ -26,6 +26,24 @@ The univariate model is strictly causal at the patch level:
 So the context can be encoded once and its per-layer K/V reused by every path
 at every step, with only the newly generated patches pushed through.
 
+Memory
+------
+The context's K/V are kept once, at batch 1. Each path stores only the patches
+it generated itself (at most ``(n_steps - 1) * output_patches`` of them).
+Attention for an appended patch is one softmax over ``[shared context | own
+tail]`` — the same attention as over the concatenated keys, without ever
+materialising ``num_samples`` copies of the context. Memory therefore does not
+scale with ``num_samples x context length``, which is what lets a very long
+context (tens of thousands of patches) run at all.
+
+Gaps
+----
+A patch with no observed value (an all-NaN gap) is legal input, handled the
+way :meth:`Yug_Model.forward` handles it: it is never an attention key, and
+its own attention output is zero (its residual stream still flows through the
+MLP). Series with gaps therefore stay on this engine rather than falling back
+to the exact path.
+
 Numerical contract
 ------------------
 This is *mathematically* identical to :meth:`Yug_Model.forward`, not
@@ -97,8 +115,15 @@ class CachedUnivariateEngine:
         self._rope_len = 0
 
         # Populated by begin().
-        self._k: list[torch.Tensor] | None = None
-        self._v: list[torch.Tensor] | None = None
+        # Per-layer K/V of the shared context, each (1, H, S0, hd).
+        self._pk: list[torch.Tensor] = []
+        self._pv: list[torch.Tensor] = []
+        # Per-layer K/V each path generated itself, each (B, H, tail_max, hd).
+        self._sk: list[torch.Tensor] = []
+        self._sv: list[torch.Tensor] = []
+        self._n_prefix = 0  # S0: patches in the shared context
+        self._valid: torch.Tensor | None = None  # (S0,) context patches with data
+        self._all_valid = True
         self._pos = 0
         self._freq_emb: torch.Tensor | None = None
         self._state: _RevInState | None = None
@@ -197,17 +222,70 @@ class CachedUnivariateEngine:
         x = self.m.input_norm_tar(x)
         return x, mean, std, nxt
 
-    def _decode(self, x: torch.Tensor, start: int, write: bool) -> torch.Tensor:
-        """Run the decoder stack over ``x`` at absolute offset ``start``.
+    def _attend_shared_prefix(
+        self,
+        li: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        start: int,
+    ) -> torch.Tensor:
+        """Attention for newly appended tokens over ``[shared context | own tail]``.
 
-        Keys and values for these positions are written into the cache; queries
-        attend over the cache slice ``[0, start + S)``.
+        ``q``, ``k``, ``v`` are ``(B, H, S, hd)`` at absolute positions
+        ``start .. start+S-1``, with ``start >= S0``. The context K/V exist once
+        (batch 1); each path keeps only its own generated tail. The softmax runs
+        over the union of the two key sets, so this is the same attention as
+        SDPA over the concatenated keys without materialising ``B`` copies of
+        the context.
+
+        Every new query sits after the whole context, so it sees all of it (bar
+        empty patches); inside the tail the causal rule is applied by position.
+        The ``B`` paths' queries are stacked along the query axis for the
+        context part, so the context K/V are read once, not ``B`` times.
+        """
+        b, h, s, hd = q.shape
+        s0 = self._n_prefix
+        lo = start - s0  # where these tokens land in the tail
+        n_tail = lo + s
+
+        self._sk[li][:, :, lo:n_tail] = k
+        self._sv[li][:, :, lo:n_tail] = v
+        tk, tv = self._sk[li][:, :, :n_tail], self._sv[li][:, :, :n_tail]
+        pk, pv = self._pk[li][0], self._pv[li][0]  # (H, S0, hd)
+
+        scale = hd**-0.5
+        qf = q.transpose(0, 1).reshape(h, b * s, hd)
+        s_ctx = torch.matmul(qf, pk.transpose(-1, -2)) * scale  # (H, B*S, S0)
+        if not self._all_valid:
+            assert self._valid is not None
+            # Empty patches are never keys.
+            s_ctx = s_ctx.masked_fill(~self._valid, float("-inf"))
+
+        qi = torch.arange(start, start + s, device=q.device).unsqueeze(1)
+        ki = s0 + torch.arange(n_tail, device=q.device).unsqueeze(0)
+        s_tail = (torch.matmul(q, tk.transpose(-1, -2)) * scale).masked_fill(
+            ki > qi, float("-inf")
+        )  # (B, H, S, n_tail)
+        s_tail = s_tail.transpose(0, 1).reshape(h, b * s, n_tail)
+
+        p = torch.softmax(
+            torch.cat([s_ctx, s_tail], dim=-1), dim=-1, dtype=torch.float32
+        ).to(q.dtype)  # (H, B*S, S0 + n_tail)
+        out_ctx = torch.matmul(p[..., :s0], pv)  # (H, B*S, hd)
+        out_tail = torch.matmul(
+            p[..., s0:].reshape(h, b, s, n_tail).transpose(0, 1), tv
+        )  # (B, H, S, hd)
+        return out_ctx.reshape(h, b, s, hd).transpose(0, 1) + out_tail
+
+    def _decode(self, x: torch.Tensor, start: int) -> torch.Tensor:
+        """Run the decoder stack over ``x`` ``(B, S, D)`` at absolute offset ``start``.
+
+        ``start == 0`` encodes the shared context (batch 1) and keeps its K/V.
+        ``start > 0`` appends new tokens: their K/V go to each path's own tail,
+        and they attend over the shared context plus that tail.
         """
         b, s, _ = x.shape
-        end = start + s
-        k_cache, v_cache = self._k, self._v
-        if write and (k_cache is None or v_cache is None):
-            raise RuntimeError("KV cache not allocated — call begin() first")
 
         for li, layer in enumerate(self.layers):
             sa = layer.self_attn_tar
@@ -222,28 +300,26 @@ class CachedUnivariateEngine:
             q = self._apply_rope(q, start, s)
             k = self._apply_rope(k, start, s)
 
-            if write and k_cache is not None and v_cache is not None:
-                k_cache[li][:, :, start:end] = k
-                v_cache[li][:, :, start:end] = v
-                k_all = k_cache[li][:, :, :end]
-                v_all = v_cache[li][:, :, :end]
-            else:
-                k_all, v_all = k, v
-
             if start == 0:
-                # Square and fully causal with every patch valid, so is_causal
-                # lets SDPA pick a flash kernel instead of materialising an
-                # (B, H, S, S) additive bias.
-                attn = F.scaled_dot_product_attention(q, k_all, v_all, is_causal=True)
+                self._pk[li], self._pv[li] = k.contiguous(), v.contiguous()
+                if self._all_valid:
+                    # Square and fully causal with every patch valid, so
+                    # is_causal lets SDPA pick a flash kernel instead of
+                    # materialising an (B, H, S, S) additive bias.
+                    attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                else:
+                    assert self._valid is not None
+                    keep = torch.ones(s, s, dtype=torch.bool, device=x.device).tril_()
+                    keep &= self._valid  # empty patches are never keys
+                    attn = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+                    # ...and an empty patch's own row emits nothing (a row with
+                    # no valid key at all comes out NaN; the model zeroes those
+                    # too).
+                    attn = attn.nan_to_num(0.0) * self._valid.view(1, 1, s, 1).to(
+                        attn.dtype
+                    )
             else:
-                # Non-square: the queries are the LAST S positions of the key
-                # range, i.e. bottom-right causal alignment. is_causal assumes
-                # top-left, so build the bias explicitly — it is only (S, end).
-                qi = torch.arange(start, end, device=x.device).unsqueeze(1)
-                ki = torch.arange(end, device=x.device).unsqueeze(0)
-                bias = torch.zeros(s, end, device=x.device, dtype=q.dtype)
-                bias.masked_fill_(ki > qi, float("-inf"))
-                attn = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=bias)
+                attn = self._attend_shared_prefix(li, q, k, v, start)
 
             attn = attn.transpose(1, 2).contiguous().view(b, s, self.D)
             x = residual + sa.out(attn)
@@ -290,14 +366,10 @@ class CachedUnivariateEngine:
 
         s = patches.shape[1]
 
-        # The pure-causal fast path needs every patch to be a valid attention
-        # token. Left-padding only ever blanks part of the first patch, so its
-        # element sum stays > 0; the caller checks this too and falls back.
-        if not bool((mask.sum(-1) > 0).all()):
-            raise ValueError(
-                "cached engine requires every patch to hold at least one valid "
-                "point; use engine='exact' for interior-gap series"
-            )
+        # Patches holding no observed value at all (interior gaps). Left-padding
+        # only blanks part of patch 0, so the common case has none of them.
+        self._valid = (mask.sum(-1) > 0)[0]  # (S,)
+        self._all_valid = bool(self._valid.all())
 
         fe = self.m.freq_embedding(freq_id, scale=scale)
         if fe.dim() == 1:
@@ -306,35 +378,23 @@ class CachedUnivariateEngine:
 
         nl = len(self.layers)
 
-        # Full per-path cache, plus a batch-1 scratch for the prefix pass.
+        # The context's K/V are stored once (batch 1, filled by the pass below);
+        # only the patches generated during the rollout get a per-path cache.
         cache_dtype = self.m.input_layer.input_layer.weight.dtype
-        full_k = [
+        self._n_prefix = s
+        self._pk = [torch.empty(0)] * nl
+        self._pv = [torch.empty(0)] * nl
+        tail_max = max(max_patches - s, 0)
+        self._sk = [
             torch.empty(
-                n_paths,
-                self.H,
-                max_patches,
-                self.hd,
-                device=self.device,
-                dtype=cache_dtype,
+                n_paths, self.H, tail_max, self.hd, device=self.device, dtype=cache_dtype
             )
             for _ in range(nl)
         ]
-        full_v = [torch.empty_like(t) for t in full_k]
-
-        self._k = [
-            torch.empty(1, self.H, s, self.hd, device=self.device, dtype=cache_dtype)
-            for _ in range(nl)
-        ]
-        self._v = [torch.empty_like(t) for t in self._k]
+        self._sv = [torch.empty_like(t) for t in self._sk]
 
         x, mean, std, state = self._embed(patches, mask, None)
-        x = self._decode(x, start=0, write=True)
-
-        # Broadcast the shared prefix K/V into every path's cache row.
-        for li in range(nl):
-            full_k[li][:, :, :s] = self._k[li]
-            full_v[li][:, :, :s] = self._v[li]
-        self._k, self._v = full_k, full_v
+        x = self._decode(x, start=0)
 
         self._pos = s
         self._state = state.expand(n_paths)
@@ -343,13 +403,14 @@ class CachedUnivariateEngine:
     def extend(self, patches: torch.Tensor) -> torch.Tensor:
         """Append ``(B, S, patch_len)`` newly generated patches and forecast.
 
-        Returns the new final-patch forecast, ``(B, Q, output_len)``.
+        Generated patches are always fully observed. Returns the new
+        final-patch forecast, ``(B, Q, output_len)``.
         """
         if self._state is None:
             raise RuntimeError("call begin() before extend()")
         b, s, _ = patches.shape
         mask = torch.ones_like(patches, dtype=torch.bool)
         x, mean, std, self._state = self._embed(patches, mask, self._state)
-        x = self._decode(x, start=self._pos, write=True)
+        x = self._decode(x, start=self._pos)
         self._pos += s
         return self._head(x, mean, std)

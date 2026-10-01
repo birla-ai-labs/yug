@@ -185,6 +185,14 @@ class InferenceConfig:
 class PredictionConfig:
     """Rollout behaviour for :meth:`YugPipeline.predict`.
 
+    ``context_length``
+        How many of the most recent points are fed to the model; longer
+        histories are cut to their latest ``context_length`` points. Defaults
+        to 2048, the window length Yug was trained on and the setting its
+        published benchmark scores were produced with. Feeding more history
+        is possible but takes the model outside its training regime and, on
+        GIFT-Eval, scores worse. ``None`` or ``0`` disables the cut.
+
     ``num_samples``
         Independent sampled trajectories. The returned quantile band is the
         empirical quantile across these paths, so raising it narrows Monte
@@ -203,7 +211,7 @@ class PredictionConfig:
         ``pad_len`` steps past the last real point.
     """
 
-    context_length: int | None = 8192
+    context_length: int | None = 2048
     prediction_length: int | None = None
     num_samples: int = 100
     engine: str = "cached"
