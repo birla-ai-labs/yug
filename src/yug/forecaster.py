@@ -412,7 +412,7 @@ class YugForecaster:
                         int(num_input_patches_override), min(n_patches_b)
                     )
                 else:
-                    num_input_patches = int(min(n_patches_b))
+                    num_input_patches = batch["n_patches"].to(device)
 
                 if mode == "univariate":
                     inp = batch["input"].to(device, dtype=torch.float32)

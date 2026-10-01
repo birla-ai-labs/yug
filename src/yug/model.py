@@ -919,8 +919,15 @@ class Yug_Model(nn.Module):
 
         # The statistics mask is different: it stops at the observed history.
         if num_input_patches is not None:
-            stats_mask_target = attn_mask_target.clone()
-            stats_mask_target[:, num_input_patches:, :] = 0
+            if isinstance(num_input_patches, torch.Tensor):
+                cutoffs = num_input_patches.to(target.device).reshape(-1, 1, 1)
+                positions = torch.arange(target.shape[-2], device=target.device).reshape(
+                    1, -1, 1
+                )
+                stats_mask_target = attn_mask_target * (positions < cutoffs)
+            else:
+                stats_mask_target = attn_mask_target.clone()
+                stats_mask_target[:, num_input_patches:, :] = 0
         else:
             stats_mask_target = attn_mask_target
 
@@ -950,8 +957,15 @@ class Yug_Model(nn.Module):
             # Same history/generated split as the target: in multivariate
             # rollout the covariate channels are extended alongside it.
             if num_input_patches is not None:
-                stats_mask_variates = attn_mask_variates.clone()
-                stats_mask_variates[:, :, num_input_patches:, :] = 0
+                if isinstance(num_input_patches, torch.Tensor):
+                    cutoffs = num_input_patches.to(variates.device).reshape(-1, 1, 1, 1)
+                    positions = torch.arange(
+                        variates.shape[-2], device=variates.device
+                    ).reshape(1, 1, -1, 1)
+                    stats_mask_variates = attn_mask_variates * (positions < cutoffs)
+                else:
+                    stats_mask_variates = attn_mask_variates.clone()
+                    stats_mask_variates[:, :, num_input_patches:, :] = 0
             else:
                 stats_mask_variates = attn_mask_variates
 
