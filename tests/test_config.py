@@ -97,6 +97,11 @@ def test_prediction_config_rejects_nonsense(kwargs):
         PredictionConfig(**kwargs)
 
 
+def test_default_context_length_is_the_trained_window():
+    """2048 is what Yug was trained on and what its published scores used."""
+    assert PredictionConfig().context_length == 2048
+
+
 @pytest.mark.network
 def test_staged_hub_config_matches_the_released_defaults():
     """The config.json we publish must describe the architecture the code builds.

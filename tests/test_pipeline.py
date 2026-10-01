@@ -99,6 +99,25 @@ def test_cached_and_exact_engines_agree(pipeline, series):
     assert np.abs(cached - exact).max() <= 1e-4 * max(scale, 1.0)
 
 
+def test_cached_engine_handles_interior_gaps(pipeline, series, tiny_config, monkeypatch):
+    """A series with all-NaN patches stays on the cached engine and agrees with
+    the exact one, which runs the model's own forward over the same gaps."""
+    gappy = series.copy()
+    p = tiny_config.patch_len
+    gappy[3 * p : 6 * p] = np.nan  # three whole patches with no observed value
+    gappy[10 * p + 2 : 12 * p] = np.nan
+
+    def no_fallback(*args, **kwargs):
+        raise AssertionError("cached rollout fell back to the exact engine")
+
+    exact = pipeline.predict(gappy, 40, num_samples=16, seed=0, engine="exact").values
+    monkeypatch.setattr(pipeline, "_rollout_exact", no_fallback)
+    cached = pipeline.predict(gappy, 40, num_samples=16, seed=0, engine="cached").values
+    assert np.isfinite(cached).all()
+    scale = np.abs(exact).mean()
+    assert np.abs(cached - exact).max() <= 1e-4 * max(scale, 1.0)
+
+
 def test_more_samples_do_not_change_the_median_much(pipeline, series):
     """A sanity check that the band is a Monte Carlo estimate, not noise."""
     few = pipeline.predict(series, 32, num_samples=8, seed=0).median
@@ -111,6 +130,17 @@ def test_context_longer_than_the_limit_is_truncated_not_rejected(pipeline, serie
     long_series = np.tile(series, 8)
     forecast = pipeline.predict(long_series, 16, num_samples=4, seed=0, context_length=64)
     assert forecast.values.shape == (1, 3, 16)
+
+
+def test_default_context_reads_only_the_latest_2048_points(pipeline, series):
+    """Anything older than the trained window must not change the forecast."""
+    rng = np.random.default_rng(0)
+    recent = np.tile(series, 8)  # exactly 2048 points
+    older = rng.normal(0, 50, 1000).astype(np.float32)
+    with_history = np.concatenate([older, recent])
+    a = pipeline.predict(with_history, 16, num_samples=4, seed=0).values
+    b = pipeline.predict(recent, 16, num_samples=4, seed=0).values
+    assert np.array_equal(a, b)
 
 
 def test_multivariate_context_is_accepted(pipeline, series):
@@ -147,9 +177,60 @@ def test_prediction_length_is_required(pipeline, series):
         pipeline.predict(series)
 
 
-def test_context_shorter_than_one_patch_is_rejected(pipeline, tiny_config):
-    with pytest.raises(ValueError, match="whole patches"):
-        pipeline.predict(np.ones(tiny_config.patch_len - 1, dtype=np.float32), 8)
+def test_context_shorter_than_one_patch_is_padded_not_rejected(
+    pipeline, series, tiny_config
+):
+    """M4 yearly has series shorter than a patch; they must still be forecast."""
+    short = series[: tiny_config.patch_len - 3]
+    forecast = pipeline.predict(short, 8, num_samples=4, seed=0)
+    assert forecast.values.shape == (1, 3, 8)
+    assert np.isfinite(forecast.values).all()
+
+
+def test_empty_context_is_rejected(pipeline):
+    with pytest.raises(ValueError, match="empty"):
+        pipeline.predict([np.array([], dtype=np.float32)], 8)
+
+
+# -------------------------------------------------------- constant contexts
+def test_constant_context_forecasts_the_constant(pipeline):
+    flat = np.full(64, 42.5, dtype=np.float32)
+    values = pipeline.predict(flat, 20, num_samples=4, seed=0).values
+    assert (values == 42.5).all()
+
+
+def test_constant_context_ignores_missing_values(pipeline):
+    flat = np.full(64, 3.0, dtype=np.float32)
+    flat[[0, 10, 40]] = np.nan
+    values = pipeline.predict(flat, 8, num_samples=4, seed=0).values
+    assert (values == 3.0).all()
+
+
+def test_constant_check_sees_the_whole_series_not_just_the_window(pipeline, series):
+    """Flat over the last context_length points, but not before: not constant."""
+    tail_flat = np.concatenate([series, np.full(64, 7.0, dtype=np.float32)])
+    values = pipeline.predict(
+        tail_flat, 16, num_samples=8, seed=0, context_length=32
+    ).values
+    assert not (values == 7.0).all()
+
+
+def test_constant_context_keeps_the_rng_stream_aligned(pipeline, series):
+    """A skipped series consumes the draws its rollout would have made."""
+    flat = np.full(64, 1.0, dtype=np.float32)
+    after_flat = pipeline.predict([flat, series], 40, num_samples=8, seed=0).values[1]
+    after_series = pipeline.predict(
+        [series[::-1].copy(), series], 40, num_samples=8, seed=0
+    ).values[1]
+    assert np.array_equal(after_flat, after_series)
+
+
+def test_a_generator_seed_spans_several_calls(pipeline, series):
+    one_call = pipeline.predict([series, series[:200]], 24, num_samples=8, seed=3).values
+    rng = np.random.default_rng(3)
+    first = pipeline.predict(series, 24, num_samples=8, seed=rng).values
+    second = pipeline.predict(series[:200], 24, num_samples=8, seed=rng).values
+    assert np.array_equal(one_call, np.concatenate([first, second]))
 
 
 def test_unknown_engine_is_rejected(pipeline, series):
