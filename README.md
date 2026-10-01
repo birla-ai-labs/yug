@@ -39,14 +39,6 @@ First public release of Yug.
 |---|---|---|---|
 | [`birlaailabs/yug`](https://huggingface.co/birlaailabs/yug) | 271.8M | 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9 | 2048 |
 
-Quantile levels are fixed at training time: a checkpoint cannot emit a level it
-was not trained on.
-
-Yug was trained on 2048-point context windows, so by default it reads the
-latest 2048 points of each series; shorter series are used whole. This is
-also the setting behind its published benchmark scores. Pass
-`context_length=...` to change it; feeding more history takes the model
-outside its training regime.
 
 ---
 
@@ -140,8 +132,6 @@ multivariate = np.stack([target, covariate_1, covariate_2])
 forecast = pipeline.predict([multivariate], prediction_length=48)
 ```
 
-Covariate forecasts degrade faster with horizon than univariate ones. For long
-horizons the univariate path is often the better answer — measure both.
 
 ### 4. In a GluonTS benchmark
 
@@ -160,6 +150,7 @@ forecasts = list(predictor.predict(dataset))
 
 - [`notebooks/quickstart.ipynb`](notebooks/quickstart.ipynb) — forecast, plot
   and score a series end to end. Self-contained; generates its own data.
+- [`notebooks/gift_eval.ipynb`](notebooks/gift_eval.ipynb) — run the GIFT-Eval benchmark to reproduce the published scores.
 
 ---
 
@@ -180,9 +171,7 @@ Note: Aaditya Jain and Debdeep Sanyal contributed equally.
 
 ## License
 
-Code in this repository is licensed under the
-[Apache License 2.0](LICENSE). Model weights on Hugging Face are licensed
-separately under a noncommercial license — see the model card for terms.
+Code in this repository is licensed under the [Apache License 2.0](LICENSE). Model weights on Hugging Face are licensed separately under a noncommercial license, see the [model card](https://huggingface.co/birlaailabs/yug) for terms.
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)](pyproject.toml)
