@@ -119,6 +119,28 @@ def test_multivariate_context_is_accepted(pipeline, series):
     assert forecast.values.shape == (1, 3, 16)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("engine", ["cached", "exact"])
+def test_reduced_precision_inference(staged_checkpoint, series, dtype, engine):
+    pipeline = YugPipeline.from_pretrained(
+        staged_checkpoint, device_map="cpu", dtype=dtype
+    )
+    forecast = pipeline.predict(series, 17, num_samples=4, seed=0, engine=engine)
+    assert forecast.values.shape == (1, 3, 17)
+    assert np.isfinite(forecast.values).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_reduced_precision_multivariate_inference(staged_checkpoint, series, dtype):
+    pipeline = YugPipeline.from_pretrained(
+        staged_checkpoint, device_map="cpu", dtype=dtype
+    )
+    context = np.stack([series, np.roll(series, 3)])
+    forecast = pipeline.predict([context], 17, num_samples=4, seed=0)
+    assert forecast.values.shape == (1, 3, 17)
+    assert np.isfinite(forecast.values).all()
+
+
 # ------------------------------------------------------------------ errors
 def test_prediction_length_is_required(pipeline, series):
     with pytest.raises(ValueError, match="prediction_length is required"):
