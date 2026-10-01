@@ -1,0 +1,22 @@
+# Normalise line endings so diffs stay clean across platforms.
+* text=auto eol=lf
+
+*.py    text diff=python
+*.md    text
+*.yaml  text
+*.yml   text
+*.json  text
+*.cff   text
+*.ipynb text
+
+# Count notebooks as Python in GitHub's language stats, and keep their JSON
+# churn out of pull-request diffs.
+*.ipynb linguist-language=Python
+*.ipynb -linguist-detectable
+
+# Weights never belong in this repository (see .gitignore); the rules below
+# exist so that an accidental `git add -f` is at least stored via LFS rather
+# than inlined into history. The Hub repo carries the real LFS config.
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+*.pt          filter=lfs diff=lfs merge=lfs -text
+*.pth         filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,126 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yug"
+dynamic = ["version"]
+description = "Yug — a foundation model for zero-shot probabilistic time-series forecasting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+keywords = [
+    "time-series",
+    "forecasting",
+    "foundation-model",
+    "transformer",
+    "probabilistic-forecasting",
+    "pytorch",
+]
+authors = [
+    { name = "Birla AI Labs" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Kept deliberately small: this is what a user installs just to run a forecast.
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.23",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0"]
+gluonts = ["gluonts>=0.14", "pandas>=2.0"]
+test = ["pytest>=8.0", "pytest-cov>=5.0"]
+typecheck = ["mypy>=1.10"]
+dev = [
+    "yug[pandas,gluonts,test,typecheck]",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/birla-ai-labs/yug"
+Repository = "https://github.com/birla-ai-labs/yug"
+Issues = "https://github.com/birla-ai-labs/yug/issues"
+
+[project.scripts]
+yug-check = "yug.__main__:main"
+
+[tool.hatch.version]
+path = "src/yug/__about__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yug"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/CITATION.cff",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not network'"
+markers = [
+    "slow: takes more than a few seconds",
+    "gpu: requires a CUDA device",
+    "network: downloads from the Hugging Face Hub",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",   # line length is handled by the formatter
+    "B008",   # torch APIs legitimately take calls as defaults
+    "E741",   # short mathematical names (l, O, Q) read fine here
+]
+
+[tool.ruff.format]
+# Lint the Python in Markdown code blocks and notebooks, but do not reformat
+# it: the aligned trailing comments and wide dataset-list comments in the
+# README, model card and notebooks are deliberate, and ruff collapses them.
+exclude = ["*.md", "*.ipynb"]
+
+[tool.ruff.lint.per-file-ignores]
+# The architecture keeps the trained module and tensor names verbatim.
+"src/yug/model.py" = ["N801", "N806"]
+"src/yug/engine.py" = ["N801", "N806"]
+"tests/*" = ["B011"]
+# Notebooks interleave imports with narrative code and open data files inline;
+# these rules are noise in that context rather than real defects.
+"notebooks/*.ipynb" = ["E402", "I001", "SIM115"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+ignore_missing_imports = true
+# Deliberately permissive for a first release: the tensor code is not fully
+# annotated yet. Tighten as annotations land, module by module.
+disallow_untyped_defs = false
+check_untyped_defs = true
+exclude = ["^notebooks/"]

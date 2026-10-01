@@ -1,0 +1,63 @@
+# --- Model weights and data: these must never enter git history -------------
+# Weights live on the Hugging Face Hub; datasets and results live outside the
+# repo. A single stray checkpoint here bloats every future clone permanently.
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.npy
+*.npz
+*.parquet
+*.arrow
+data/
+datasets/
+checkpoints/
+results/
+results_*/
+outputs/
+wandb/
+lightning_logs/
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.installed.cfg
+pip-wheel-metadata/
+
+# --- Environments -----------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.env
+notebooks/.env
+notebooks/.local_checkpoint/
+
+# --- Tooling caches ---------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.hypothesis/
+
+# --- Notebooks --------------------------------------------------------------
+.ipynb_checkpoints/
+
+# --- Editors and OS ---------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

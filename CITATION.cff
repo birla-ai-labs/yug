@@ -1,0 +1,34 @@
+# GitHub reads this file natively and renders a "Cite this repository" button.
+cff-version: 1.2.0
+title: "Yug: a foundation model for zero-shot probabilistic time-series forecasting"
+message: "If you use this software or model, please cite it as below."
+type: software
+# Note - Aaditya Jain and Debdeep Sanyal contributed equally.
+authors:
+  - given-names: "Aaditya"
+    family-names: "Jain"
+    affiliation: "Birla AI Labs"
+  - given-names: "Debdeep"
+    family-names: "Sanyal"
+    affiliation: "Birla AI Labs"
+  - given-names: "Aaryan"
+    family-names: "Nagpal"
+    affiliation: "Birla AI Labs"
+  - given-names: "Dhruv"
+    family-names: "Kumar"
+    affiliation: "Birla AI Labs"
+  - given-names: "Murari"
+    family-names: "Mandal"
+    affiliation: "Birla AI Labs"
+  - given-names: "Saurabh"
+    family-names: "Deshpande"
+    affiliation: "Birla AI Labs"
+repository-code: "https://github.com/birla-ai-labs/yug"
+license: Apache-2.0
+version: 0.1.0
+keywords:
+  - time series
+  - forecasting
+  - foundation model
+  - probabilistic forecasting
+  - transformer

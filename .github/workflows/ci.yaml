@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch: the GPU wheels are ~2 GB and CI has no accelerator.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e '.[test,pandas,gluonts]'
+
+      - name: Test
+        run: pytest -ra --cov=yug --cov-report=term-missing
+
+  lint:
+    name: lint and type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e '.[test,typecheck]' ruff
+
+      - name: Ruff (lint)
+        run: ruff check --output-format=github .
+
+      - name: Ruff (format)
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy src
+
+  build:
+    name: build and install the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Install the wheel in a clean environment and import it
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+          /tmp/fresh/bin/pip install dist/*.whl
+          # Catches the packaging mistakes a source checkout hides: a module
+          # left out of the wheel, or a missing runtime dependency.
+          /tmp/fresh/bin/python -c "import yug; print(yug.__version__)"
+          /tmp/fresh/bin/yug-check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
