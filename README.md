@@ -88,19 +88,21 @@ pipeline = YugPipeline.from_pretrained(
     "birlaailabs/yug", device_map="cuda"
 )
 
-# Synthetic daily signal: trend + weekly/annual seasonality + noise
-HORIZON = 48
-rng = np.random.default_rng(15)
-t = np.arange(1000)
+# Synthetic signal: trend + 64-step season + 12-step season + noise
+CONTEXT, HORIZON, PERIOD = 2000, 256, 64
+rng = np.random.default_rng([20240902, 315595964, 0])
+t = np.arange(CONTEXT + HORIZON)
+trend = np.linspace(0.0, rng.uniform(50, 150), len(t))
+phase1, amp1 = rng.uniform(0, 6), rng.uniform(10, 30)
+phase2, amp2 = rng.uniform(0, 6), rng.uniform(2, 8)
 signal = (
-    100.0                                    # level
-    + 0.05 * t                               # trend
-    + 12.0 * np.sin(2 * np.pi * t / 7)      # weekly cycle
-    + 25.0 * np.sin(2 * np.pi * t / 365)    # annual cycle
-    + rng.normal(0, 3.0, len(t))             # noise
+    trend                                                 # trend
+    + amp1 * np.sin(2 * np.pi * t / PERIOD + phase1)      # 64-step season
+    + amp2 * np.sin(2 * np.pi * t / 12 + phase2)          # 12-step season
+    + rng.normal(0, 1.0, len(t))                          # noise
 ).astype(np.float32)
 
-context, truth = signal[:-HORIZON], signal[-HORIZON:]
+context, truth = signal[:CONTEXT], signal[CONTEXT:]
 
 forecast = pipeline.predict(
     context,
@@ -109,9 +111,9 @@ forecast = pipeline.predict(
     seed=0,              # makes the call reproducible
 )
 
-print(forecast.median)                # (48,)      point forecast
-print(forecast.quantile(0.9))         # (48,)
-print(forecast.interval())            # {"lower": (48,), "upper": (48,)}
+print(forecast.median)                # (256,)     point forecast
+print(forecast.quantile(0.9))         # (256,)
+print(forecast.interval())            # {"lower": (256,), "upper": (256,)}
 print(forecast.to_dataframe().head())
 ```
 
