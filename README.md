@@ -97,17 +97,21 @@ signal = (
 context, truth = signal[:CONTEXT], signal[CONTEXT:]
 
 forecast = pipeline.predict(
-    context,
+    context=context,
     prediction_length=HORIZON,
     freq="D",            # a model input, not metadata: pandas offset alias
+    num_samples=30,      # trajectories drawn to estimate the quantiles
     seed=0,              # makes the call reproducible
 )
 
-print(forecast.median)                # (256,)     point forecast
-print(forecast.quantile(0.9))         # (256,)
+print(forecast.median)                # (256,)   median (point) forecast
+print(forecast.quantile(0.9))         # (256,)   upper quantile
 print(forecast.interval())            # {"lower": (256,), "upper": (256,)}
 print(forecast.to_dataframe().head())
 ```
+
+> **Note**
+> - `num_samples` — trajectories drawn to estimate the quantile band. More samples give smoother, more accurate quantiles but run slower; the default is `100`. On CPU, a lower value (e.g. `30`) is usually a good trade-off.
 
 ### 2. Several series at once
 
