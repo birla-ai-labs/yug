@@ -307,6 +307,8 @@ class YugPipeline(BaseForecastPipeline):
             raise ValueError(f"prediction_length must be >= 1, got {horizon}")
 
         n_samples = int(num_samples if num_samples is not None else d.num_samples)
+        if n_samples < 1:
+            raise ValueError(f"num_samples must be >= 1, got {n_samples}")
         ctx_limit = context_length if context_length is not None else d.context_length
         engine_mode = engine or d.engine
         side = pad_side or d.pad_side
