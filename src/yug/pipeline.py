@@ -606,7 +606,17 @@ def _as_series_list(context) -> list[np.ndarray]:
         first = context[0]
         if np.isscalar(first) or (isinstance(first, np.generic) and np.ndim(first) == 0):
             return [np.asarray(context, dtype=np.float32)]
-        return [np.asarray(s, dtype=np.float32) for s in context]
+        out = []
+        for s in context:
+            try:
+                out.append(np.asarray(s, dtype=np.float32))
+            except ValueError as exc:
+                raise ValueError(
+                    "could not read a context series as a numeric array; if this "
+                    "is a covariate stack, every channel must have the same "
+                    "length (got an inhomogeneous shape)."
+                ) from exc
+        return out
 
     # pandas Series / DataFrame and anything else array-like.
     arr = np.asarray(getattr(context, "values", context), dtype=np.float32)
