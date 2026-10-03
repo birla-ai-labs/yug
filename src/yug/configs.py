@@ -201,8 +201,8 @@ class PredictionConfig:
     ``engine``
         ``"cached"`` encodes the context once and reuses its per-layer K/V,
         pushing only newly generated patches through the network (~9x faster).
-        ``"exact"`` reproduces the reference implementation's tensor shapes and
-        is bitwise identical to it. See :mod:`yug.engine`.
+        ``"exact"`` reproduces the reference implementation's tensor shapes,
+        matching it to the fp32 floor. See :mod:`yug.engine`.
 
     ``pad_side``
         Series are grown to a whole number of patches with masked sentinels.
