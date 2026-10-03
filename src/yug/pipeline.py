@@ -360,6 +360,13 @@ class YugPipeline(BaseForecastPipeline):
         # Blocks needed to cover the horizon; the tail is trimmed afterwards.
         n_steps = -(-horizon // self._output_len)
 
+        channel = target[0] if multivariate else target
+        finite = channel[np.isfinite(channel)]
+        if finite.size == 0:
+            raise ValueError(
+                "context has no finite observations (all NaN/inf); cannot forecast."
+            )
+
         # An exactly constant context carries no scale. The causal RevIn floors
         # the variance at eps, so the model's output would be denormalised as
         # ``z * sqrt(eps) + mean``: a spuriously dispersed, non-flat forecast of
@@ -367,9 +374,7 @@ class YugPipeline(BaseForecastPipeline):
         # is checked on the whole series, before the context_length cut, and
         # it still consumes the rollout's draws so every later series in the
         # same stream is unchanged.
-        channel = target[0] if multivariate else target
-        finite = channel[np.isfinite(channel)]
-        if finite.size and not np.ptp(finite) > 0:
+        if not np.ptp(finite) > 0:
             rng.random(n_samples * n_steps)
             return np.full((self._n_quantiles, horizon), finite[-1], dtype=np.float32)
 
@@ -389,7 +394,14 @@ class YugPipeline(BaseForecastPipeline):
             paths = self._rollout_exact(target, freq, n_steps, n_samples, rng)
 
         traj = paths[:, :horizon]
-        return np.quantile(traj, self.quantile_levels, axis=0).astype(np.float32)
+        band = np.quantile(traj, self.quantile_levels, axis=0).astype(np.float32)
+        if not np.isfinite(band).all():
+            raise ValueError(
+                "forecast contained non-finite values; this could mean the "
+                "context magnitude overflowed float32 statistics — rescaling the "
+                "series before forecasting might help."
+            )
+        return band
 
     def _freq_tensors(self, freq: str, n: int):
         fid, scale = freq_id(freq)
