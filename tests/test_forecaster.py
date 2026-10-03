@@ -166,3 +166,34 @@ def test_gluonts_adapter_is_zero_shot_only(pipeline):
     predictor = YugPredictor(pipeline, prediction_length=8)
     with pytest.raises(NotImplementedError, match="finetune"):
         predictor.train()
+
+
+def test_gluonts_adapter_runs_make_evaluation_predictions(pipeline, series):
+    """The predictor is drop-in for make_evaluation_predictions.
+
+    Covers the two contract points that used to crash: the harness reads
+    predictor.lead_time to size the holdout window, and calls
+    predict(dataset, num_samples=...). The result is scored through the
+    GluonTS Evaluator to confirm a full forecast flows end to end.
+    """
+    import pandas as pd
+    from gluonts.dataset.common import ListDataset
+    from gluonts.evaluation import Evaluator
+    from gluonts.evaluation.backtest import make_evaluation_predictions
+
+    from yug.gluonts_adapter import YugPredictor
+
+    predictor = YugPredictor(pipeline, freq="D", prediction_length=16, num_samples=4)
+    assert predictor.lead_time == 0
+
+    ds = ListDataset(
+        [{"start": pd.Period("2020-01-01", freq="D"), "target": series}], freq="D"
+    )
+    forecasts, tss = make_evaluation_predictions(ds, predictor=predictor, num_samples=8)
+    forecasts, tss = list(forecasts), list(tss)
+    assert len(forecasts) == 1
+
+    # num_workers=0 keeps the Evaluator single-process; metric values are
+    # irrelevant here, only that a finite result flows through.
+    agg, _ = Evaluator(quantiles=[0.1, 0.5, 0.9], num_workers=0)(iter(tss), iter(forecasts))
+    assert np.isfinite(agg["MASE"])
