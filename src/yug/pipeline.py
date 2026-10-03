@@ -254,7 +254,7 @@ class YugPipeline(BaseForecastPipeline):
         context: ContextLike,
         prediction_length: int | None = None,
         *,
-        freq: str | Sequence[str] = "D",
+        freq: str | Sequence[str] | None = "D",
         num_samples: int | None = None,
         context_length: int | None = None,
         engine: str | None = None,
@@ -601,7 +601,9 @@ def _as_series_list(context) -> list[np.ndarray]:
     return _as_series_list(arr)
 
 
-def _broadcast_freq(freq: str | Sequence[str], n: int) -> list[str]:
+def _broadcast_freq(freq: str | Sequence[str] | None, n: int) -> list[str]:
+    if freq is None:
+        freq = "D"
     if isinstance(freq, str):
         return [freq] * n
     freqs = list(freq)
