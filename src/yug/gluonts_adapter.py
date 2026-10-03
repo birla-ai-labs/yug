@@ -64,11 +64,13 @@ class YugPredictor:
         pad_side: str = "left",
         seed: int = 0,
         target_index: int = 0,
+        lead_time: int = 0,
     ) -> None:
         self.pipeline = pipeline
         self.freq = str(freq)
         self.prediction_length = prediction_length
         self.num_samples = int(num_samples)
+        self.lead_time = int(lead_time)
         self.context_length = context_length
         self.engine = engine
         self.pad_side = pad_side
@@ -104,9 +106,18 @@ class YugPredictor:
         )
 
     def predict(
-        self, dataset: Iterable[dict], prediction_length: int | None = None
+        self,
+        dataset: Iterable[dict],
+        prediction_length: int | None = None,
+        num_samples: int | None = None,
+        **kwargs: Any,
     ) -> Iterator:
-        """Yield one GluonTS ``QuantileForecast`` per dataset entry."""
+        """Yield one GluonTS ``QuantileForecast`` per dataset entry.
+
+        ``num_samples`` and extra kwargs are accepted so the predictor works
+        with GluonTS harnesses like ``make_evaluation_predictions``. An
+        explicit ``num_samples`` overrides the instance default.
+        """
         try:
             from gluonts.model.forecast import QuantileForecast
         except ImportError as exc:  # pragma: no cover - depends on the install
@@ -122,6 +133,7 @@ class YugPredictor:
                 "prediction_length missing: pass it to predict(), or to the constructor."
             )
         horizon = int(horizon)
+        n_samples = self.num_samples if num_samples is None else int(num_samples)
 
         # One stream for the whole call, advanced entry by entry, exactly like
         # the reference predictor that produced the published GIFT-Eval
@@ -137,7 +149,7 @@ class YugPredictor:
                 [target],  # a one-element batch
                 horizon,
                 freq=_entry_freq(entry, self.freq),
-                num_samples=self.num_samples,
+                num_samples=n_samples,
                 context_length=self.context_length,
                 engine=self.engine,
                 pad_side=self.pad_side,
