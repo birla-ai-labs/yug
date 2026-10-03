@@ -195,5 +195,7 @@ def test_gluonts_adapter_runs_make_evaluation_predictions(pipeline, series):
 
     # num_workers=0 keeps the Evaluator single-process; metric values are
     # irrelevant here, only that a finite result flows through.
-    agg, _ = Evaluator(quantiles=[0.1, 0.5, 0.9], num_workers=0)(iter(tss), iter(forecasts))
+    agg, _ = Evaluator(quantiles=[0.1, 0.5, 0.9], num_workers=0)(
+        iter(tss), iter(forecasts)
+    )
     assert np.isfinite(agg["MASE"])

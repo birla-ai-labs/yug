@@ -57,9 +57,7 @@ class QuantileForecast:
                 f"levels were given"
             )
         if item_ids is not None and len(item_ids) != values.shape[0]:
-            raise ValueError(
-                f"got {len(item_ids)} item_ids for {values.shape[0]} series"
-            )
+            raise ValueError(f"got {len(item_ids)} item_ids for {values.shape[0]} series")
 
         self.values = values
         self.quantile_levels = [float(q) for q in quantile_levels]
