@@ -357,6 +357,24 @@ class YugPipeline(BaseForecastPipeline):
         if target.shape[-1] == 0:
             raise ValueError("context is empty; supply at least one observation.")
 
+        if multivariate:
+            n_channels = target.shape[0]
+            n_covariates = n_channels - 1
+            if n_covariates > 128:
+                raise ValueError(
+                    f"{n_covariates} covariates is not supported (maximum 128). "
+                    f"If this is a (time, channels) array, pass it as "
+                    f"(channels, time) with the target as row 0."
+                )
+            if n_channels > target.shape[1]:
+                logger.warning(
+                    "covariate stack is (%d channels, %d steps); did you pass it "
+                    "transposed? The expected layout is (channels, time) with the "
+                    "target as row 0.",
+                    n_channels,
+                    target.shape[1],
+                )
+
         # Blocks needed to cover the horizon; the tail is trimmed afterwards.
         n_steps = -(-horizon // self._output_len)
 
