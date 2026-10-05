@@ -48,6 +48,12 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# A context is rescaled when its standard deviation is within this factor of
+# the RevIn variance floor sqrt(eps). The transform is a no-op above the
+# floor, so the margin only decides how early the rescue starts; 100 keeps
+# it well clear of the band where attenuation first becomes measurable.
+_SCALE_MARGIN = 100.0
+
 __all__ = ["YugPipeline"]
 
 CONFIG_NAME = "config.json"
@@ -79,6 +85,9 @@ class YugPipeline(BaseForecastPipeline):
 
         self._patch_len = config.patch_len
         self._output_len = config.output_dim
+        # Lowest standard deviation the causal RevIn can represent; see
+        # _unit_scale_affine.
+        self._revin_std_floor = float(config.eps) ** 0.5
         self._output_patches = config.output_patches
         self._n_quantiles = config.num_quantiles
 
@@ -399,6 +408,20 @@ class YugPipeline(BaseForecastPipeline):
         if context_length and target.shape[-1] > context_length:
             target = target[..., -context_length:]
 
+        # Lift a sub-floor context to unit scale; inverted on the band below.
+        # Computed after the cut, so the deviation is the one the model will
+        # actually normalise over.
+        affine = _unit_scale_affine(target, self._revin_std_floor)
+        if affine is not None:
+            offset, gain = affine
+            target = ((target - offset) * gain).astype(np.float32)
+            logger.debug(
+                "context deviation %.3e is under the RevIn floor %.3e; "
+                "forecasting at unit scale",
+                1.0 / gain,
+                self._revin_std_floor,
+            )
+
         # A context shorter than one patch is padded up to one like any other
         # partial patch (M4 yearly has 13-point series); padded positions are
         # masked out of attention and the normalisation statistics.
@@ -413,6 +436,9 @@ class YugPipeline(BaseForecastPipeline):
 
         traj = paths[:, :horizon]
         band = np.quantile(traj, self.quantile_levels, axis=0).astype(np.float32)
+        if affine is not None:
+            offset, gain = affine
+            band = (band / gain + offset).astype(np.float32)
         if not np.isfinite(band).all():
             raise ValueError(
                 "forecast contained non-finite values; this could mean the "
@@ -639,6 +665,41 @@ def _as_series_list(context) -> list[np.ndarray]:
     # pandas Series / DataFrame and anything else array-like.
     arr = np.asarray(getattr(context, "values", context), dtype=np.float32)
     return _as_series_list(arr)
+
+
+def _unit_scale_affine(target: np.ndarray, floor: float) -> tuple[float, float] | None:
+    """``(offset, gain)`` carrying ``target`` clear of the RevIn variance floor.
+
+    The causal RevIn divides by ``sqrt(m2 / n + eps)``, so the running standard
+    deviation can never fall below ``sqrt(eps)``: 1e-3 at the published
+    ``eps=1e-6``. A series whose own deviation is under that floor reaches the
+    patch embedding attenuated by ``std / sqrt(eps)`` -- a 1e-6 amplitude signal
+    arrives ~460x flattened -- so the model sees a flat line and returns noise,
+    which denormalisation then scales back up to the series' own magnitude.
+
+    Normalisation is exactly affine-equivariant above the floor, so forecasting
+    ``(x - offset) * gain`` and inverting on the quantile band leaves ordinary
+    series untouched and rescues these. Returns ``None`` when no rescale is
+    needed, which is the common case.
+
+    ``gain`` is built from the smallest positive per-channel deviation so no
+    channel is left under the floor; there is no upper-end failure mode, so
+    lifting a well-conditioned channel is harmless. Centring is equivariant too
+    and keeps the shifted values representable when a large offset rides on a
+    tiny signal, which ``1e9 + 1e-6`` would otherwise lose entirely in float32.
+    """
+    if target.ndim == 2:
+        devs = [float(np.std(c[np.isfinite(c)])) for c in target if np.isfinite(c).any()]
+        devs = [d for d in devs if d > 0.0]
+        dev = min(devs) if devs else 0.0
+    else:
+        dev = float(np.std(target[np.isfinite(target)]))
+
+    if not np.isfinite(dev) or dev <= 0.0 or dev >= _SCALE_MARGIN * floor:
+        return None
+
+    finite = target[np.isfinite(target)]
+    return float(np.mean(finite)), 1.0 / dev
 
 
 def _broadcast_freq(freq: str | Sequence[str] | None, n: int) -> list[str]:
