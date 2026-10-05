@@ -15,7 +15,7 @@ distribution summarised by quantile levels.
 
 ---
 
-## Update — October 2026
+## Update: October 2026
 
 First public release of Yug.
 
@@ -111,7 +111,7 @@ print(forecast.to_dataframe().head())
 ```
 
 > **Note**
-> - `num_samples` — trajectories drawn to estimate the quantile band. More samples give smoother, more accurate quantiles but run slower; the default is `100`. On CPU, a lower value (e.g. `30`) is usually a good trade-off.
+> - `num_samples`: trajectories drawn to estimate the quantile band. More samples give smoother, more accurate quantiles but run slower; the default is `100`. On CPU, a lower value (e.g. `30`) is usually a good trade-off.
 
 ### 2. Several series at once
 
@@ -152,9 +152,9 @@ forecasts = list(predictor.predict(dataset))
 
 ## Examples
 
-- [`notebooks/quickstart.ipynb`](notebooks/quickstart.ipynb) — forecast, plot
+- [`notebooks/quickstart.ipynb`](notebooks/quickstart.ipynb): forecast, plot
   and score a series end to end. Self-contained; generates its own data.
-- [`notebooks/gift_eval.ipynb`](notebooks/gift_eval.ipynb) — run the GIFT-Eval benchmark to reproduce the published scores.
+- [`notebooks/gift_eval.ipynb`](notebooks/gift_eval.ipynb): run the GIFT-Eval benchmark to reproduce the published scores.
 
 ---
 

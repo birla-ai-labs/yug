@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "yug"
 dynamic = ["version"]
-description = "Yug — a foundation model for zero-shot probabilistic time-series forecasting"
+description = "Yug: a foundation model for zero-shot probabilistic time-series forecasting"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

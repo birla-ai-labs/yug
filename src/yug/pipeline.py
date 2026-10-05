@@ -48,6 +48,12 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# A context is rescaled when its standard deviation is within this factor of
+# the RevIn variance floor sqrt(eps). The transform is a no-op above the
+# floor, so the margin only decides how early the rescue starts; 100 keeps
+# it well clear of the band where attenuation first becomes measurable.
+_SCALE_MARGIN = 100.0
+
 __all__ = ["YugPipeline"]
 
 CONFIG_NAME = "config.json"
@@ -79,6 +85,9 @@ class YugPipeline(BaseForecastPipeline):
 
         self._patch_len = config.patch_len
         self._output_len = config.output_dim
+        # Lowest standard deviation the causal RevIn can represent; see
+        # _unit_scale_affine.
+        self._revin_std_floor = float(config.eps) ** 0.5
         self._output_patches = config.output_patches
         self._n_quantiles = config.num_quantiles
 
@@ -254,7 +263,7 @@ class YugPipeline(BaseForecastPipeline):
         context: ContextLike,
         prediction_length: int | None = None,
         *,
-        freq: str | Sequence[str] = "D",
+        freq: str | Sequence[str] | None = "D",
         num_samples: int | None = None,
         context_length: int | None = None,
         engine: str | None = None,
@@ -307,6 +316,8 @@ class YugPipeline(BaseForecastPipeline):
             raise ValueError(f"prediction_length must be >= 1, got {horizon}")
 
         n_samples = int(num_samples if num_samples is not None else d.num_samples)
+        if n_samples < 1:
+            raise ValueError(f"num_samples must be >= 1, got {n_samples}")
         ctx_limit = context_length if context_length is not None else d.context_length
         engine_mode = engine or d.engine
         side = pad_side or d.pad_side
@@ -355,8 +366,33 @@ class YugPipeline(BaseForecastPipeline):
         if target.shape[-1] == 0:
             raise ValueError("context is empty; supply at least one observation.")
 
+        if multivariate:
+            n_channels = target.shape[0]
+            n_covariates = n_channels - 1
+            if n_covariates > 128:
+                raise ValueError(
+                    f"{n_covariates} covariates is not supported (maximum 128). "
+                    f"If this is a (time, channels) array, pass it as "
+                    f"(channels, time) with the target as row 0."
+                )
+            if n_channels > target.shape[1]:
+                logger.warning(
+                    "covariate stack is (%d channels, %d steps); did you pass it "
+                    "transposed? The expected layout is (channels, time) with the "
+                    "target as row 0.",
+                    n_channels,
+                    target.shape[1],
+                )
+
         # Blocks needed to cover the horizon; the tail is trimmed afterwards.
         n_steps = -(-horizon // self._output_len)
+
+        channel = target[0] if multivariate else target
+        finite = channel[np.isfinite(channel)]
+        if finite.size == 0:
+            raise ValueError(
+                "context has no finite observations (all NaN/inf); cannot forecast."
+            )
 
         # An exactly constant context carries no scale. The causal RevIn floors
         # the variance at eps, so the model's output would be denormalised as
@@ -365,14 +401,26 @@ class YugPipeline(BaseForecastPipeline):
         # is checked on the whole series, before the context_length cut, and
         # it still consumes the rollout's draws so every later series in the
         # same stream is unchanged.
-        channel = target[0] if multivariate else target
-        finite = channel[np.isfinite(channel)]
-        if finite.size and not np.ptp(finite) > 0:
+        if not np.ptp(finite) > 0:
             rng.random(n_samples * n_steps)
             return np.full((self._n_quantiles, horizon), finite[-1], dtype=np.float32)
 
         if context_length and target.shape[-1] > context_length:
             target = target[..., -context_length:]
+
+        # Lift a sub-floor context to unit scale; inverted on the band below.
+        # Computed after the cut, so the deviation is the one the model will
+        # actually normalise over.
+        affine = _unit_scale_affine(target, self._revin_std_floor)
+        if affine is not None:
+            offset, gain = affine
+            target = ((target - offset) * gain).astype(np.float32)
+            logger.debug(
+                "context deviation %.3e is under the RevIn floor %.3e; "
+                "forecasting at unit scale",
+                1.0 / gain,
+                self._revin_std_floor,
+            )
 
         # A context shorter than one patch is padded up to one like any other
         # partial patch (M4 yearly has 13-point series); padded positions are
@@ -387,7 +435,17 @@ class YugPipeline(BaseForecastPipeline):
             paths = self._rollout_exact(target, freq, n_steps, n_samples, rng)
 
         traj = paths[:, :horizon]
-        return np.quantile(traj, self.quantile_levels, axis=0).astype(np.float32)
+        band = np.quantile(traj, self.quantile_levels, axis=0).astype(np.float32)
+        if affine is not None:
+            offset, gain = affine
+            band = (band / gain + offset).astype(np.float32)
+        if not np.isfinite(band).all():
+            raise ValueError(
+                "forecast contained non-finite values; this could mean the "
+                "context magnitude overflowed float32 statistics — rescaling the "
+                "series before forecasting might help."
+            )
+        return band
 
     def _freq_tensors(self, freq: str, n: int):
         fid, scale = freq_id(freq)
@@ -592,14 +650,61 @@ def _as_series_list(context) -> list[np.ndarray]:
         first = context[0]
         if np.isscalar(first) or (isinstance(first, np.generic) and np.ndim(first) == 0):
             return [np.asarray(context, dtype=np.float32)]
-        return [np.asarray(s, dtype=np.float32) for s in context]
+        out = []
+        for s in context:
+            try:
+                out.append(np.asarray(s, dtype=np.float32))
+            except ValueError as exc:
+                raise ValueError(
+                    "could not read a context series as a numeric array; if this "
+                    "is a covariate stack, every channel must have the same "
+                    "length (got an inhomogeneous shape)."
+                ) from exc
+        return out
 
     # pandas Series / DataFrame and anything else array-like.
     arr = np.asarray(getattr(context, "values", context), dtype=np.float32)
     return _as_series_list(arr)
 
 
-def _broadcast_freq(freq: str | Sequence[str], n: int) -> list[str]:
+def _unit_scale_affine(target: np.ndarray, floor: float) -> tuple[float, float] | None:
+    """``(offset, gain)`` carrying ``target`` clear of the RevIn variance floor.
+
+    The causal RevIn divides by ``sqrt(m2 / n + eps)``, so the running standard
+    deviation can never fall below ``sqrt(eps)``: 1e-3 at the published
+    ``eps=1e-6``. A series whose own deviation is under that floor reaches the
+    patch embedding attenuated by ``std / sqrt(eps)`` -- a 1e-6 amplitude signal
+    arrives ~460x flattened -- so the model sees a flat line and returns noise,
+    which denormalisation then scales back up to the series' own magnitude.
+
+    Normalisation is exactly affine-equivariant above the floor, so forecasting
+    ``(x - offset) * gain`` and inverting on the quantile band leaves ordinary
+    series untouched and rescues these. Returns ``None`` when no rescale is
+    needed, which is the common case.
+
+    ``gain`` is built from the smallest positive per-channel deviation so no
+    channel is left under the floor; there is no upper-end failure mode, so
+    lifting a well-conditioned channel is harmless. Centring is equivariant too
+    and keeps the shifted values representable when a large offset rides on a
+    tiny signal, which ``1e9 + 1e-6`` would otherwise lose entirely in float32.
+    """
+    if target.ndim == 2:
+        devs = [float(np.std(c[np.isfinite(c)])) for c in target if np.isfinite(c).any()]
+        devs = [d for d in devs if d > 0.0]
+        dev = min(devs) if devs else 0.0
+    else:
+        dev = float(np.std(target[np.isfinite(target)]))
+
+    if not np.isfinite(dev) or dev <= 0.0 or dev >= _SCALE_MARGIN * floor:
+        return None
+
+    finite = target[np.isfinite(target)]
+    return float(np.mean(finite)), 1.0 / dev
+
+
+def _broadcast_freq(freq: str | Sequence[str] | None, n: int) -> list[str]:
+    if freq is None:
+        freq = "D"
     if isinstance(freq, str):
         return [freq] * n
     freqs = list(freq)

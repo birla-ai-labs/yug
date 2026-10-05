@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from yug import QuantileForecast, YugConfig, YugPipeline
+from yug.pipeline import _unit_scale_affine
 
 
 # ----------------------------------------------------------------- loading
@@ -223,6 +224,41 @@ def test_constant_context_keeps_the_rng_stream_aligned(pipeline, series):
         [series[::-1].copy(), series], 40, num_samples=8, seed=0
     ).values[1]
     assert np.array_equal(after_flat, after_series)
+
+
+# ------------------------------------------------------- sub-floor contexts
+# The causal RevIn cannot represent a deviation below sqrt(eps) (1e-3 at the
+# published eps=1e-6), so a tiny-amplitude series used to reach the model
+# flattened and come back as noise. The pipeline now forecasts such a context at
+# unit scale and inverts the transform on the band.
+def test_tiny_amplitude_context_is_scale_equivariant(pipeline, series):
+    """A sub-floor series must forecast like the same shape at unit scale."""
+    tiny = (series * 1e-6).astype(np.float32)
+    at_unit = pipeline.predict(series, 32, num_samples=8, seed=0).values
+    at_tiny = pipeline.predict(tiny, 32, num_samples=8, seed=0).values
+    assert np.allclose(at_tiny, at_unit * 1e-6, rtol=1e-4, atol=0.0)
+
+
+def test_the_rescale_is_what_makes_it_equivariant(pipeline, series, monkeypatch):
+    """Without the guard the same shape at 1e-6 gives a materially different band."""
+    monkeypatch.setattr("yug.pipeline._unit_scale_affine", lambda target, floor: None)
+    tiny = (series * 1e-6).astype(np.float32)
+    at_unit = pipeline.predict(series, 32, num_samples=8, seed=0).values
+    at_tiny = pipeline.predict(tiny, 32, num_samples=8, seed=0).values
+    assert not np.allclose(at_tiny, at_unit * 1e-6, rtol=1e-4, atol=0.0)
+
+
+def test_ordinary_scale_context_is_left_untouched(pipeline, series):
+    """Above the floor the guard must not fire at all."""
+    assert _unit_scale_affine(series, pipeline._revin_std_floor) is None
+    assert _unit_scale_affine(series * 1e9, pipeline._revin_std_floor) is None
+
+
+@pytest.mark.parametrize("scale", [1e-7, 1.0, 1e7])
+def test_multivariate_context_survives_any_scale(pipeline, series, scale):
+    stack = np.stack([series, series * 0.5]).astype(np.float32) * scale
+    values = pipeline.predict(stack, 16, num_samples=4, seed=0).values
+    assert np.isfinite(values).all()
 
 
 def test_a_generator_seed_spans_several_calls(pipeline, series):
