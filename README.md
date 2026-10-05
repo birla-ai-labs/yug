@@ -11,7 +11,7 @@ distribution summarised by quantile levels.
 - Issues and questions: [GitHub Issues](https://github.com/birla-ai-labs/yug/issues)
 
 
-**Latest version: Yug 0.1.0**
+**Latest version: Yug 0.1.1**
 
 ---
 
