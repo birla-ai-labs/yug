@@ -10,7 +10,8 @@ Three configs, deliberately separated by lifetime:
 
 ``InferenceConfig``
     How a batch is fed to the network (device, batch size, workers). Free to
-    change per run; has no effect on the numbers the model produces.
+    change per run; it does not change the forecast beyond floating-point
+    rounding (GPU kernels are not bitwise invariant to batch size).
 
 ``PredictionConfig``
     How the autoregressive rollout is driven (context window, number of sampled

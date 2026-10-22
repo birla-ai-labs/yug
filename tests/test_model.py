@@ -150,3 +150,35 @@ def test_released_architecture_parameter_count_is_stable():
     """A change here means the published weights no longer fit the code."""
     model = Yug_Model(config=YugConfig().to_arch_dict())
     assert sum(p.numel() for p in model.parameters()) == 271_843_820
+
+
+def test_revin_survives_a_long_flat_large_magnitude_channel(tiny_model):
+    """float32 rounding must not drive the running variance below zero (NaN).
+
+    A constant of this magnitude with a few masked entries reproduces the
+    cancellation seen on rohlik_sales (a zero covariate lifted by the old
+    unit-scale offset): the summed Welford increments round negative.
+    """
+    flat = torch.full((1, 50, 16), 3302546.5)
+    mask = torch.ones_like(flat, dtype=torch.bool)
+    mask[0, 0, :3] = False
+    out, _, std = tiny_model.CausalRevIn(flat, mask)
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(std).all() and (std > 0).all()
+
+
+def test_variate_mlp_is_finite_when_attention_yields_nan(monkeypatch):
+    """No covariate observed at a timestep: a fully masked softmax must not leak NaN."""
+    from yug.model import Yug_Variate_MLP
+
+    block = Yug_Variate_MLP(hidden_size=32, rank=16, num_heads=4, num_latent=2).eval()
+    block.out_gate.data.fill_(1.0)
+    x = torch.randn(1, 3, 5, 32)
+    mask = torch.ones(1, 3, 5, dtype=torch.bool)
+    mask[:, :, 2] = False
+
+    def all_nan(q, k, v, **kwargs):
+        return torch.full_like(q, float("nan"))
+
+    monkeypatch.setattr("yug.model.F.scaled_dot_product_attention", all_nan)
+    assert torch.isfinite(block(x, x_variate_cross_attn=x, attn_mask=mask)).all()

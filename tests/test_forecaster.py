@@ -199,3 +199,21 @@ def test_gluonts_adapter_runs_make_evaluation_predictions(pipeline, series):
         iter(tss), iter(forecasts)
     )
     assert np.isfinite(agg["MASE"])
+
+
+def test_gluonts_adapter_survives_an_all_missing_entry(pipeline, series):
+    """One empty series must not abort a benchmark run (GIFT-Eval has them)."""
+    import pandas as pd
+
+    from yug.gluonts_adapter import YugPredictor
+
+    start = pd.Period("2020-01-01", freq="D")
+    dataset = [
+        {"start": start, "target": series, "item_id": "a"},
+        {"start": start, "target": np.full(64, np.nan, dtype=np.float32), "item_id": "b"},
+        {"start": start, "target": series[:200], "item_id": "c"},
+    ]
+    predictor = YugPredictor(pipeline, freq="D", prediction_length=16, num_samples=4)
+    forecasts = list(predictor.predict(dataset))
+    assert [f.item_id for f in forecasts] == ["a", "b", "c"]
+    assert all(np.isfinite(f.forecast_array).all() for f in forecasts)
