@@ -311,3 +311,124 @@ def test_asking_for_an_untrained_quantile_says_which_exist(pipeline, series):
 def test_quantile_forecast_validates_its_shape():
     with pytest.raises(ValueError, match="quantiles"):
         QuantileForecast(np.zeros((1, 3, 5)), [0.1, 0.9])
+
+
+# ------------------------------------------------- covariate-path robustness
+# Regressions for the covariate path on real data with constant covariates
+# (rohlik_sales): the unit-scale rescue used to be decided by the *smallest*
+# deviation across every channel and applied to all of them.
+def _covariate_stack(series):
+    """Target plus two ordinary covariates and two exactly-constant ones."""
+    flat = np.zeros_like(series)
+    return np.stack(
+        [series, np.roll(series, 3), np.roll(series, -3), flat, flat + 1.0]
+    ).astype(np.float32)
+
+
+def test_only_the_target_is_ever_rescaled(pipeline, series):
+    """A near-constant covariate must not set the scale of the whole stack."""
+    seen: list[np.ndarray] = []
+    original = pipeline._rollout_multivariate
+
+    def spy(target, freq, n_steps, n_paths, rng):
+        seen.append(target.copy())
+        return original(target, freq, n_steps, n_paths, rng)
+
+    pipeline._rollout_multivariate = spy
+    stack = _covariate_stack(series)
+    stack[3] += 1e-7 * np.sin(np.arange(stack.shape[1]))  # constant + jitter
+    pipeline.predict([stack], 8, num_samples=2, seed=0)
+
+    assert np.array_equal(seen[0][1:], stack[1:])  # covariates untouched
+    assert np.array_equal(seen[0][0], stack[0])  # ordinary target untouched
+
+
+def test_tiny_target_is_rescaled_but_its_covariates_are_not(pipeline, series):
+    seen: list[np.ndarray] = []
+    original = pipeline._rollout_multivariate
+
+    def spy(target, freq, n_steps, n_paths, rng):
+        seen.append(target.copy())
+        return original(target, freq, n_steps, n_paths, rng)
+
+    pipeline._rollout_multivariate = spy
+    stack = _covariate_stack(series)
+    stack[0] *= 1e-6
+    pipeline.predict([stack], 8, num_samples=2, seed=0)
+
+    assert not np.array_equal(seen[0][0], stack[0])  # rescued to unit scale
+    assert np.array_equal(seen[0][1:], stack[1:])  # covariates left alone
+
+
+def test_jitter_on_a_constant_covariate_cannot_flip_the_forecast(pipeline, series):
+    """1e-7 noise on a constant covariate used to move the forecast by orders more."""
+    stack = _covariate_stack(series)
+    jittered = stack.copy()
+    jittered[3] += 1e-7 * np.sin(np.arange(stack.shape[1])).astype(np.float32)
+    a = pipeline.predict([stack], 16, num_samples=8, seed=0).values
+    b = pipeline.predict([jittered], 16, num_samples=8, seed=0).values
+    assert np.allclose(a, b, rtol=0.05, atol=0.05 * np.abs(a).mean())
+
+
+def test_covariate_forecast_does_not_depend_on_what_ran_before(staged_checkpoint, series):
+    """The cached forecaster's batch size must not come from the first call."""
+    stack = _covariate_stack(series)
+    fresh = YugPipeline.from_pretrained(staged_checkpoint, device_map="cpu")
+    primed = YugPipeline.from_pretrained(staged_checkpoint, device_map="cpu")
+    primed.predict([stack], 8, num_samples=1, seed=0)
+    a = fresh.predict([stack], 16, num_samples=40, seed=0).values
+    b = primed.predict([stack], 16, num_samples=40, seed=0).values
+    assert np.array_equal(a, b)
+    assert fresh._forecaster.cfg.batch_size == primed._forecaster.cfg.batch_size
+
+
+def test_covariate_rollout_encodes_the_shared_context_once(pipeline, series):
+    """Every path holds the same context at step 0, so one record serves them all."""
+    stack = _covariate_stack(series)
+    pipeline.predict([stack], 8, num_samples=2, seed=0)  # builds the forecaster
+    calls: list[int] = []
+    original = pipeline._forecaster.predict_batch
+
+    def spy(records, **kwargs):
+        calls.append(len(records))
+        return original(records, **kwargs)
+
+    pipeline._forecaster.predict_batch = spy
+    horizon = pipeline._output_len  # exactly one block -> a single step
+    pipeline.predict([stack], horizon, num_samples=25, seed=0)
+    assert calls == [1]
+
+    calls.clear()
+    pipeline.predict([stack], 2 * horizon, num_samples=25, seed=0)
+    assert calls == [1, 25]  # paths diverge after step 0
+
+
+# ------------------------------------------------------ all-missing contexts
+# GIFT-Eval (bitbrains_*, electricity/W) contains windows whose target is
+# entirely missing. They must be forecast like any other -- fully masked, as
+# 0.1.0 and the reference GIFT-Eval predictor do -- not abort the whole run.
+@pytest.mark.parametrize("engine", ["cached", "exact"])
+@pytest.mark.parametrize("horizon", [8, 40])
+def test_all_missing_context_is_forecast_not_rejected(pipeline, engine, horizon):
+    empty = np.full(64, np.nan, dtype=np.float32)
+    values = pipeline.predict(empty, horizon, num_samples=4, seed=0, engine=engine).values
+    assert values.shape == (1, 3, horizon)
+    assert np.isfinite(values).all()
+
+
+def test_all_missing_target_with_covariates_is_forecast(pipeline, series):
+    stack = np.stack([np.full_like(series, np.nan), series])
+    values = pipeline.predict([stack], 16, num_samples=4, seed=0).values
+    assert np.isfinite(values).all()
+
+
+def test_all_missing_series_does_not_disturb_its_neighbours(pipeline, series):
+    """It still consumes its share of the RNG stream, like every other series."""
+    empty = np.full(64, np.nan, dtype=np.float32)
+    rng = np.random.default_rng(0)
+    alone_first = pipeline.predict(series, 24, num_samples=8, seed=rng).values
+    pipeline.predict(empty, 24, num_samples=8, seed=rng)
+    alone_last = pipeline.predict(series[:200], 24, num_samples=8, seed=rng).values
+    together = pipeline.predict([series, empty, series[:200]], 24, num_samples=8, seed=0)
+    assert np.array_equal(together.values[0], alone_first[0])
+    assert np.array_equal(together.values[2], alone_last[0])

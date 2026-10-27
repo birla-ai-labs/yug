@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 # it well clear of the band where attenuation first becomes measurable.
 _SCALE_MARGIN = 100.0
 
+# Contexts per forward pass in the covariate rollout. Fixed, so a forecast never
+# depends on ``num_samples`` or on which call built the cached forecaster.
+_MULTIVARIATE_BATCH = 32
+
 __all__ = ["YugPipeline"]
 
 CONFIG_NAME = "config.json"
@@ -387,12 +391,14 @@ class YugPipeline(BaseForecastPipeline):
         # Blocks needed to cover the horizon; the tail is trimmed afterwards.
         n_steps = -(-horizon // self._output_len)
 
+        # A context with no finite observation at all is not an error: every
+        # patch is masked out and the model forecasts from what it still sees
+        # (the frequency embedding). Benchmarks contain such series -- GIFT-Eval's
+        # bitbrains and electricity/W windows include all-missing targets -- and
+        # the reference GIFT-Eval predictor forecasts them this way, so rejecting
+        # them would abort an entire benchmark run over one empty series.
         channel = target[0] if multivariate else target
         finite = channel[np.isfinite(channel)]
-        if finite.size == 0:
-            raise ValueError(
-                "context has no finite observations (all NaN/inf); cannot forecast."
-            )
 
         # An exactly constant context carries no scale. The causal RevIn floors
         # the variance at eps, so the model's output would be denormalised as
@@ -401,7 +407,7 @@ class YugPipeline(BaseForecastPipeline):
         # is checked on the whole series, before the context_length cut, and
         # it still consumes the rollout's draws so every later series in the
         # same stream is unchanged.
-        if not np.ptp(finite) > 0:
+        if finite.size and not np.ptp(finite) > 0:
             rng.random(n_samples * n_steps)
             return np.full((self._n_quantiles, horizon), finite[-1], dtype=np.float32)
 
@@ -411,10 +417,16 @@ class YugPipeline(BaseForecastPipeline):
         # Lift a sub-floor context to unit scale; inverted on the band below.
         # Computed after the cut, so the deviation is the one the model will
         # actually normalise over.
-        affine = _unit_scale_affine(target, self._revin_std_floor)
+        scaled = target[0] if multivariate else target
+        affine = _unit_scale_affine(scaled, self._revin_std_floor)
         if affine is not None:
             offset, gain = affine
-            target = ((target - offset) * gain).astype(np.float32)
+            if multivariate:
+                # Target row only; see _unit_scale_affine.
+                target = target.copy()
+                target[0] = ((target[0] - offset) * gain).astype(np.float32)
+            else:
+                target = ((target - offset) * gain).astype(np.float32)
             logger.debug(
                 "context deviation %.3e is under the RevIn floor %.3e; "
                 "forecasting at unit scale",
@@ -593,36 +605,58 @@ class YugPipeline(BaseForecastPipeline):
         covariates track the target — good enough to extend the window, but the
         reason covariate forecasts degrade faster with horizon than univariate
         ones.
-        """
-        if self._forecaster is None:
-            inf_cfg = InferenceConfig.from_model_config(
-                self.config, batch_size=n_paths, num_workers=0, device=str(self.device)
-            )
-            self._forecaster = YugForecaster(model=self.model, cfg=inf_cfg)
 
-        paths = [target.copy() for _ in range(n_paths)]
+        Step 0 runs the network once: every path holds the identical context, so
+        one forward pass serves them all and the paths only diverge through their
+        sampled ``u``. Later steps carry one distinct context per path and are
+        run in fixed-size chunks.
+        """
+        paths: list[np.ndarray] | None = None
         collected = np.empty((n_paths, n_steps * self._output_len), dtype=np.float32)
 
         for step in range(n_steps):
-            records = [{"target": p, "freq": freq} for p in paths]
-            result = self._forecaster.predict_batch(records, mode="multivariate")
-            qf = np.sort(
-                np.stack(
-                    [result.last_window_forecast(series_i=i) for i in range(n_paths)]
-                ),
-                axis=1,
-            )
+            if paths is None:
+                qf = np.broadcast_to(
+                    np.sort(self._multivariate_qf([target], freq), axis=1),
+                    (n_paths, self._n_quantiles, self._output_len),
+                )
+            else:
+                qf = np.sort(self._multivariate_qf(paths, freq), axis=1)
 
             us = rng.random(n_paths)
             block = self._sampler(qf, us)
             collected[:, step * self._output_len : (step + 1) * self._output_len] = block
 
             if step < n_steps - 1:
-                for i in range(n_paths):
-                    tile = np.tile(block[i], (paths[i].shape[0], 1))
-                    paths[i] = np.concatenate([paths[i], tile], axis=1)
+                if paths is None:
+                    paths = [target for _ in range(n_paths)]
+                paths = [
+                    np.concatenate([p, np.tile(block[i], (p.shape[0], 1))], axis=1)
+                    for i, p in enumerate(paths)
+                ]
 
         return collected
+
+    def _multivariate_qf(self, contexts: list[np.ndarray], freq: str) -> np.ndarray:
+        """Quantile forecast of the final patch for each ``(channels, time)`` context."""
+        if self._forecaster is None:
+            # A constant batch size, not the first call's ``num_samples``: GPU
+            # kernels are not bitwise batch-invariant, so a batch size inherited
+            # from whichever call ran first would make the same call give
+            # different answers depending on what ran before it.
+            inf_cfg = InferenceConfig.from_model_config(
+                self.config,
+                batch_size=_MULTIVARIATE_BATCH,
+                num_workers=0,
+                device=str(self.device),
+            )
+            self._forecaster = YugForecaster(model=self.model, cfg=inf_cfg)
+
+        records = [{"target": c, "freq": freq} for c in contexts]
+        result = self._forecaster.predict_batch(records, mode="multivariate")
+        return np.stack(
+            [result.last_window_forecast(series_i=i) for i in range(len(contexts))]
+        )
 
 
 # --------------------------------------------------------------------- helpers
@@ -668,7 +702,7 @@ def _as_series_list(context) -> list[np.ndarray]:
 
 
 def _unit_scale_affine(target: np.ndarray, floor: float) -> tuple[float, float] | None:
-    """``(offset, gain)`` carrying ``target`` clear of the RevIn variance floor.
+    """``(offset, gain)`` carrying a 1-D ``target`` clear of the RevIn variance floor.
 
     The causal RevIn divides by ``sqrt(m2 / n + eps)``, so the running standard
     deviation can never fall below ``sqrt(eps)``: 1e-3 at the published
@@ -682,23 +716,25 @@ def _unit_scale_affine(target: np.ndarray, floor: float) -> tuple[float, float] 
     series untouched and rescues these. Returns ``None`` when no rescale is
     needed, which is the common case.
 
-    ``gain`` is built from the smallest positive per-channel deviation so no
-    channel is left under the floor; there is no upper-end failure mode, so
-    lifting a well-conditioned channel is harmless. Centring is equivariant too
-    and keeps the shifted values representable when a large offset rides on a
-    tiny signal, which ``1e9 + 1e-6`` would otherwise lose entirely in float32.
+    Only the *target* is ever rescaled. RevIn normalises every channel on its
+    own, so the target's forecast does not need its covariates moved, and moving
+    them is harmful: a shared offset turns an all-zero covariate into a huge
+    constant whose float32 running statistics are rounding noise, and a
+    covariate that is constant up to ~1e-7 of jitter would otherwise set the
+    gain for the whole stack and flip it on or off discontinuously. A covariate
+    below the floor is simply read as flat, exactly as it is for any other
+    series. Centring keeps the shifted values representable when a large
+    offset rides on a tiny signal, which ``1e9 + 1e-6`` would otherwise lose
+    entirely in float32.
     """
-    if target.ndim == 2:
-        devs = [float(np.std(c[np.isfinite(c)])) for c in target if np.isfinite(c).any()]
-        devs = [d for d in devs if d > 0.0]
-        dev = min(devs) if devs else 0.0
-    else:
-        dev = float(np.std(target[np.isfinite(target)]))
+    finite = target[np.isfinite(target)]
+    if finite.size == 0:
+        return None
+    dev = float(np.std(finite))
 
     if not np.isfinite(dev) or dev <= 0.0 or dev >= _SCALE_MARGIN * floor:
         return None
 
-    finite = target[np.isfinite(target)]
     return float(np.mean(finite)), 1.0 / dev
 
 

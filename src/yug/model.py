@@ -634,6 +634,11 @@ class Yug_Variate_MLP(nn.Module):
         attn_out = F.scaled_dot_product_attention(
             q_4d, k_4d, v_4d, attn_mask=mask_4d, is_causal=False, dropout_p=0.0
         )
+        # A timestep with no observed covariate masks every key, and softmax over
+        # all -inf is NaN on torch<2.5 (and on some backends since). The query
+        # has nothing to pool there, so zero is the right value; the residual
+        # ``pooled_residual`` term is already guarded by its clamped denominator.
+        attn_out = attn_out.nan_to_num(0.0)
 
         out = attn_out.transpose(1, 2).contiguous()
         out = out.reshape(batch, seq_len, self.num_latent * self.rank)
@@ -790,7 +795,11 @@ class CausalReversibleInstanceNorm(nn.Module):
 
         sm = torch.zeros_like(cm)
         sm[:, 1:] = cm[:, :-1]
-        m2 = torch.cumsum((x_flat - sm) * (x_flat - cm) * mask_f, 1)
+        # Each Welford increment is non-negative in exact arithmetic, but in
+        # float32 it can round below zero when a value sits on the running mean.
+        # Over a long flat, large-magnitude stretch the sum goes negative enough
+        # to drag ``m2 / n + eps`` under zero, and the sqrt below returns NaN.
+        m2 = torch.cumsum((x_flat - sm) * (x_flat - cm) * mask_f, 1).clamp(min=0.0)
         c_std = torch.sqrt(m2 / safe_n + self.eps)
 
         # One statistic per patch: the running value at the patch's last element.
